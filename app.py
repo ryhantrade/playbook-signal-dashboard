@@ -113,9 +113,26 @@ def index():
 def api_signals():
     return jsonify(_cache)
 
-@app.route("/api/ingest", methods=["POST"])
+@app.route("/api/ingest", methods=["POST", "GET"])
 def api_ingest():
     global _cache
+    if request.method == "GET":
+        # GET fallback: VM egress blocks POST; send one market per GET
+        # /api/ingest?secret=...&market=BTC&data=<urlencoded json>
+        if request.args.get("secret", "") != INGEST_SECRET or not INGEST_SECRET:
+            return jsonify({"error": "unauthorized"}), 401
+        name = request.args.get("market", "")
+        raw = request.args.get("data", "")
+        if not name or not raw:
+            return jsonify({"error": "empty"}), 400
+        try:
+            m = json.loads(raw)
+        except Exception as e:
+            return jsonify({"error": "bad json"}), 400
+        _cache["markets"][name] = m
+        _cache["updated"] = datetime.now(timezone.utc).isoformat()
+        save_cache(_cache)
+        return jsonify({"ok": True, "market": name})
     auth = request.headers.get("Authorization", "")
     if not INGEST_SECRET or not hmac.compare_digest(auth, "Bearer " + INGEST_SECRET):
         return jsonify({"error": "unauthorized"}), 401
