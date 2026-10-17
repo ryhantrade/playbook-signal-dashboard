@@ -76,7 +76,8 @@ async function load(){
   const r=await fetch('/api/signals'); DATA=await r.json(); render();
 }
 function render(){
-  const ms=DATA.markets||{}, names=Object.keys(ms);
+  const ms=DATA.markets||{}, names=Object.keys(ms).filter(n=>n!=='__ACCOUNT__');
+  const acct=(ms['__ACCOUNT__']||{}).account||{};
   if(!names.length){document.getElementById('main').innerHTML='<p class="sub">No signal data yet — scanner updating…</p>';return;}
   if(!CUR||!ms[CUR]) CUR=names[0];
   const upd=DATA.updated?new Date(DATA.updated):null;
@@ -100,6 +101,15 @@ function render(){
     (m.recent_signals||[]).map(s=>`<tr><td>${(s.time||'').slice(0,16).replace('T',' ')}</td><td>${s.dir}</td><td>${s.entry}</td><td>${s.sl}</td><td>${s.tp}</td><td class="${s.result==='tp'?'win':s.result==='sl'?'loss':''}">${(s.result||'').toUpperCase()}</td><td class="${s.r>0?'win':s.r<0?'loss':''}">${s.r>0?'+':''}${s.r}R</td></tr>`).join('')+`</table></div>`;
   const bt=m.backtest;
   if(bt&&bt.trades!==undefined){h+=`<div class="card"><h2>Backtest (fixed 1:2R)</h2><p class="sub">${bt.trades} trades · ${(bt.win*100).toFixed(0)}% win · ${bt.avgR>=0?'+':''}${bt.avgR}R avg · ${bt.ret>=0?'+':''}${bt.ret}% return</p></div>`;}
+  // account panel
+  const an=Object.keys(acct);
+  if(an.length){h+=`<div class="card"><h2>💰 Connected accounts</h2>`+an.map(k=>{
+    const a=acct[k], b=a.balance||{}, ps=a.positions||[];
+    const poss=Array.isArray(ps)?ps.map(p=>`${p.symbol} ${p.side} ${p.qty} @ ${p.entry} (P&amp;L ${p.pnl})`).join('<br>'):(ps.error||'—');
+    return `<p><b>${k}</b> — balance $${b.total_usd??'—'}`+
+      (b.cash!==undefined?` (cash $${b.cash})`:'')+
+      `<br><small style="color:var(--mut)">Positions (${Array.isArray(ps)?ps.length:0}):</small><br>${poss||'none'}</p>`;
+  }).join('')+`</div>`;}
   document.getElementById('main').innerHTML=h;
 }
 load(); setInterval(load, 5*60*1000);
