@@ -162,5 +162,80 @@ def api_ingest():
 def health():
     return jsonify({"ok": True})
 
+# --- Forex Factory calendar proxy (for TradeMind live news) ---
+# Fetches forexfactory.com/calendar server-side (no CORS issue) and
+# returns parsed events as JSON with CORS headers for the static app.
+_ff_cache = {"fetched_at": None, "events": [], "error": None}
+import re, time
+try:
+    from html import unescape as _unescape
+except Exception:
+    def _unescape(s): return s
+
+def _fetch_ff_calendar():
+    global _ff_cache
+    now = time.time()
+    # cache for 15 minutes
+    if _ff_cache["fetched_at"] and now - _ff_cache["fetched_at"] < 900 and _ff_cache["events"]:
+        return _ff_cache
+    events = []
+    err = None
+    try:
+        import urllib.request
+        req = urllib.request.Request(
+            "https://www.forexfactory.com/calendar",
+            headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"})
+        html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
+        # Parse calendar rows
+        row_re = re.compile(r'<tr[^>]*class="[^"]*calendar__row[^"]*"[^>]*>(.*?)</tr>', re.S)
+        cell_re = re.compile(r'<td[^>]*class="[^"]*calendar__([a-z-]+)[^"]*"[^>]*>(.*?)</td>', re.S)
+        span_re = re.compile(r'<span[^>]*>(.*?)</span>', re.S)
+        tag_re = re.compile(r'<[^>]+>')
+        cur_date = ""
+        for rm in row_re.finditer(html):
+            row = rm.group(1)
+            cells = {}
+            for cm in cell_re.finditer(row):
+                cls, inner = cm.group(1), cm.group(2)
+                # impact: icon class -> High/Medium/Low/Holiday
+                if cls == "impact":
+                    m = re.search(r'icon--ff-impact-([a-z]+)', inner)
+                    cells["impact"] = {"red": "High", "ora": "Medium", "yel": "Low", "gra": "Holiday"}.get(m.group(1) if m else "", "")
+                else:
+                    sm = span_re.search(inner)
+                    txt = sm.group(1) if sm else inner
+                    txt = _unescape(tag_re.sub("", txt)).strip()
+                    cells[cls] = txt
+            if not cells.get("event"):
+                continue
+            if cells.get("date"):
+                cur_date = cells["date"]
+            events.append({
+                "date": cur_date,
+                "time": cells.get("time", ""),
+                "currency": cells.get("currency", ""),
+                "impact": cells.get("impact", ""),
+                "event": cells.get("event", ""),
+                "actual": cells.get("actual", ""),
+                "forecast": cells.get("forecast", ""),
+                "previous": cells.get("previous", ""),
+            })
+    except Exception as e:
+        err = str(e)[:200]
+    _ff_cache = {"fetched_at": now, "events": events, "error": err}
+    return _ff_cache
+
+@app.route("/api/forex-calendar")
+def api_forex_calendar():
+    d = _fetch_ff_calendar()
+    resp = jsonify({
+        "fetched_at": datetime.fromtimestamp(d["fetched_at"], tz=timezone.utc).isoformat() if d["fetched_at"] else None,
+        "count": len(d["events"]),
+        "events": d["events"],
+        "error": d["error"],
+    })
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    return resp
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
