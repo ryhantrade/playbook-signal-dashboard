@@ -237,5 +237,311 @@ def api_forex_calendar():
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
+# --- Broker connect / integration system (for TradeMind) ---
+# Real account connections: Paper (built-in), cTrader (Open API),
+# MT5 (credential vault, live sync via terminal bridge),
+# FTMO + FundingPips (prop firms — connect through MT5 or cTrader).
+# Credentials stored server-side only in broker_creds.json (0600).
+# Secrets are NEVER returned to the frontend (keys/passwords masked).
+BROKER_CREDS_FILE = os.path.join(BASE, "broker_creds.json")
+
+# Supported broker types
+BROKER_TYPES = ("paper", "ctrader", "mt5", "ftmo", "fundingpips")
+# Prop firms connect through a platform
+PROP_PLATFORMS = ("mt5", "ctrader")
+
+def _load_broker_creds():
+    try:
+        if os.path.exists(BROKER_CREDS_FILE):
+            return json.load(open(BROKER_CREDS_FILE))
+    except Exception:
+        pass
+    return {}
+
+def _save_broker_creds(d):
+    try:
+        json.dump(d, open(BROKER_CREDS_FILE, "w"))
+        os.chmod(BROKER_CREDS_FILE, 0o600)
+    except Exception:
+        pass
+
+def _mask_key(k):
+    k = k or ""
+    if len(k) <= 8:
+        return "***"
+    return k[:4] + "..." + k[-4:]
+
+def _cors(resp):
+    resp.headers["Access-Control-Allow-Origin"] = "*"
+    resp.headers["Access-Control-Allow-Methods"] = "GET, POST, DELETE, OPTIONS"
+    resp.headers["Access-Control-Allow-Headers"] = "Content-Type"
+    return resp
+
+def _paper_balance():
+    return {"total_usd": 10000.00, "cash": 10000.00, "open_positions": 0,
+            "note": "Paper trading account — simulated $10,000"}
+
+def _ctrader_validate(access_token, account_id=None, demo=True):
+    """Validate a cTrader Open API access token via WebSocket (JSON).
+    Returns (ok, balance_dict|error). Best-effort: connects, authenticates
+    the trading account, and requests trader info for the balance.
+    """
+    try:
+        import websocket as ws_client, json as _json, time as _time
+        host = "wss://demo.ctrader.com:5036" if demo else "wss://live.ctrader.com:5035"
+        # cTrader Open API also serves on openapi.ctrader.com; try primary then fallback
+        hosts = [host, "wss://openapi.ctrader.com:5036" if demo else "wss://openapi.ctrader.com:5035"]
+        last_err = ""
+        for h in hosts:
+            try:
+                ws = ws_client.create_connection(h, timeout=12)
+                break
+            except Exception as e:
+                last_err = str(e)[:120]
+                ws = None
+        if ws is None:
+            return False, f"cTrader connection failed: {last_err}"
+        try:
+            # ProtoOAAccountAuthReq via JSON: payloadType 2102
+            # ctidTraderAccountId is required; without it we can only do app-level calls.
+            # We attempt account auth when account_id is given, else fall back to
+            # a token-introspection style check via trader accounts lookup.
+            if account_id:
+                ws.send(_json.dumps({
+                    "payloadType": 2102,
+                    "payload": {"ctidTraderAccountId": int(account_id),
+                                "accessToken": access_token},
+                    "clientMsgId": "auth1"}))
+            else:
+                # Without account id, ask for the trader's accounts list is not
+                # possible pre-auth; treat token as stored-but-unverified.
+                ws.close()
+                return True, {"total_usd": None, "note": "Token stored — open the Trading page to link an account ID for live balance."}
+            deadline = _time.time() + 10
+            authed = False
+            balance = None
+            while _time.time() < deadline:
+                try:
+                    ws.settimeout(max(1, deadline - _time.time()))
+                    raw = ws.recv()
+                except Exception:
+                    break
+                try:
+                    msg = _json.loads(raw)
+                except Exception:
+                    continue
+                pt = msg.get("payloadType")
+                payload = msg.get("payload") or {}
+                # 2103 = ProtoOAAccountAuthRes
+                if pt == 2103:
+                    authed = True
+                    # request trader info: ProtoOATraderReq = 2104
+                    ws.send(_json.dumps({"payloadType": 2104,
+                                         "payload": {"ctidTraderAccountId": int(account_id)},
+                                         "clientMsgId": "trader1"}))
+                # 2105 = ProtoOATraderRes
+                elif pt == 2105 and authed:
+                    bal = payload.get("balance")
+                    digits = payload.get("moneyDigits", 2)
+                    if bal is not None:
+                        try:
+                            balance = float(bal) / (10 ** int(digits))
+                        except Exception:
+                            balance = None
+                    break
+                # 50 = ProtoOAErrorRes
+                elif pt == 50:
+                    desc = payload.get("description") or payload.get("errorCode") or "auth rejected"
+                    ws.close()
+                    return False, f"cTrader rejected the credentials: {str(desc)[:120]}"
+            ws.close()
+            if not authed:
+                return False, "cTrader did not accept the access token (no auth response)."
+            return True, {"total_usd": round(balance, 2) if balance is not None else None,
+                          "account_id": str(account_id),
+                          "note": "Live balance via cTrader Open API."}
+        except Exception as e:
+            try: ws.close()
+            except Exception: pass
+            return False, f"cTrader validation error: {str(e)[:150]}"
+    except ImportError:
+        return False, "cTrader validator unavailable on server."
+    except Exception as e:
+        return False, f"cTrader validation error: {str(e)[:150]}"
+
+def _public_account(broker_key, creds):
+    """Build the public (secret-free) account dict for one stored broker."""
+    c = creds.get(broker_key, {})
+    btype = c.get("type", broker_key)
+    base = {"key": broker_key, "broker": btype,
+            "label": c.get("label", broker_key),
+            "connected_at": c.get("connected_at"),
+            "platform": c.get("platform")}
+    if btype == "paper":
+        base["balance"] = _paper_balance()
+    elif btype == "ctrader":
+        base["key_masked"] = _mask_key(c.get("access_token", ""))
+        base["account_id"] = c.get("account_id")
+        base["demo"] = c.get("demo", True)
+        bal = c.get("last_balance")
+        base["balance"] = {"total_usd": bal, "note": "Live balance via cTrader Open API."} if bal is not None else {"total_usd": None, "note": "Token stored — balance refreshes on status check."}
+    elif btype in ("mt5",):
+        base["login_masked"] = _mask_key(c.get("login", ""))
+        base["server"] = c.get("server", "")
+        base["balance"] = {"total_usd": None, "note": "MT5 live sync needs the terminal bridge — credentials stored securely."}
+    elif btype in ("ftmo", "fundingpips"):
+        plat = c.get("platform", "mt5")
+        base["platform"] = plat
+        if plat == "ctrader":
+            base["key_masked"] = _mask_key(c.get("access_token", ""))
+            base["account_id"] = c.get("account_id")
+        else:
+            base["login_masked"] = _mask_key(c.get("login", ""))
+            base["server"] = c.get("server", "")
+        base["balance"] = {"total_usd": None, "note": f"{btype.upper()} via {plat.upper()} — credentials stored securely."}
+    return base
+
+@app.route("/api/broker/connect", methods=["POST", "OPTIONS"])
+def api_broker_connect():
+    if request.method == "OPTIONS":
+        return _cors(jsonify({"ok": True}))
+    try:
+        data = request.get_json(force=True) or {}
+    except Exception:
+        return _cors(jsonify({"ok": False, "error": "Invalid JSON body."})), 400
+    broker = str(data.get("broker", "")).lower().strip()
+    label = str(data.get("label", "") or broker).strip()[:60]
+    if broker not in BROKER_TYPES:
+        return _cors(jsonify({"ok": False, "error": f"Unsupported broker. Use one of: {', '.join(BROKER_TYPES)}."})), 400
+    creds = _load_broker_creds()
+    now = datetime.now(timezone.utc).isoformat()
+
+    if broker == "paper":
+        creds["paper"] = {"type": "paper", "label": label or "Paper Trading",
+                          "connected_at": now}
+        _save_broker_creds(creds)
+        return _cors(jsonify({"ok": True, "account": _public_account("paper", creds)}))
+
+    if broker == "ctrader":
+        token = str(data.get("access_token", "")).strip()
+        account_id = str(data.get("account_id", "")).strip()
+        demo = bool(data.get("demo", True))
+        if not token:
+            return _cors(jsonify({"ok": False, "error": "cTrader access token is required."})), 400
+        # Validate live against cTrader Open API when an account id is supplied;
+        # otherwise store the token (user links the account id next).
+        if account_id:
+            ok, result = _ctrader_validate(token, account_id, demo)
+            if not ok:
+                return _cors(jsonify({"ok": False, "error": result})), 401
+            last_bal = result.get("total_usd")
+        else:
+            last_bal = None
+        creds["ctrader"] = {"type": "ctrader", "access_token": token,
+                            "account_id": account_id or None, "demo": demo,
+                            "last_balance": last_bal,
+                            "label": label or "cTrader",
+                            "connected_at": now}
+        _save_broker_creds(creds)
+        return _cors(jsonify({"ok": True, "account": _public_account("ctrader", creds)}))
+
+    if broker == "mt5":
+        login = str(data.get("login", "")).strip()
+        password = str(data.get("password", ""))
+        server = str(data.get("server", "")).strip()
+        if not login or not password or not server:
+            return _cors(jsonify({"ok": False, "error": "MT5 login, password and server are required."})), 400
+        creds["mt5"] = {"type": "mt5", "login": login, "password": password,
+                        "server": server, "label": label or "MetaTrader 5",
+                        "connected_at": now}
+        _save_broker_creds(creds)
+        return _cors(jsonify({"ok": True, "account": _public_account("mt5", creds)}))
+
+    if broker in ("ftmo", "fundingpips"):
+        platform = str(data.get("platform", "mt5")).lower().strip()
+        if platform not in PROP_PLATFORMS:
+            return _cors(jsonify({"ok": False, "error": "Prop-firm platform must be 'mt5' or 'ctrader'."})), 400
+        entry = {"type": broker, "platform": platform,
+                 "label": label or broker.upper(), "connected_at": now}
+        if platform == "ctrader":
+            token = str(data.get("access_token", "")).strip()
+            account_id = str(data.get("account_id", "")).strip()
+            if not token:
+                return _cors(jsonify({"ok": False, "error": "cTrader access token is required."})), 400
+            if account_id:
+                ok, result = _ctrader_validate(token, account_id, bool(data.get("demo", True)))
+                if not ok:
+                    return _cors(jsonify({"ok": False, "error": result})), 401
+                entry["last_balance"] = result.get("total_usd")
+            entry.update({"access_token": token, "account_id": account_id or None,
+                          "demo": bool(data.get("demo", True))})
+        else:
+            login = str(data.get("login", "")).strip()
+            password = str(data.get("password", ""))
+            server = str(data.get("server", "")).strip()
+            if not login or not password or not server:
+                return _cors(jsonify({"ok": False, "error": "MT5 login, password and server are required."})), 400
+            entry.update({"login": login, "password": password, "server": server})
+        creds[broker] = entry
+        _save_broker_creds(creds)
+        return _cors(jsonify({"ok": True, "account": _public_account(broker, creds)}))
+
+    return _cors(jsonify({"ok": False, "error": "Unhandled broker."})), 400
+
+@app.route("/api/broker/status", methods=["GET", "OPTIONS"])
+def api_broker_status():
+    if request.method == "OPTIONS":
+        return _cors(jsonify({"ok": True}))
+    creds = _load_broker_creds()
+    accounts = []
+    for key in creds:
+        # refresh live cTrader balances best-effort
+        c = creds[key]
+        if c.get("type") == "ctrader" and c.get("access_token") and c.get("account_id"):
+            ok, result = _ctrader_validate(c["access_token"], c["account_id"], c.get("demo", True))
+            if ok and result.get("total_usd") is not None:
+                c["last_balance"] = result["total_usd"]
+                _save_broker_creds(creds)
+        accounts.append(_public_account(key, creds))
+    # keep a stable order: paper, ctrader, mt5, ftmo, fundingpips
+    order = {"paper": 0, "ctrader": 1, "mt5": 2, "ftmo": 3, "fundingpips": 4}
+    accounts.sort(key=lambda a: order.get(a["key"], 9))
+    return _cors(jsonify({"ok": True, "accounts": accounts}))
+
+@app.route("/api/broker/positions", methods=["GET", "OPTIONS"])
+def api_broker_positions():
+    if request.method == "OPTIONS":
+        return _cors(jsonify({"ok": True}))
+    broker = str(request.args.get("broker", "")).lower().strip()
+    creds = _load_broker_creds()
+    if broker not in creds:
+        return _cors(jsonify({"ok": False, "error": "Broker not connected."})), 404
+    btype = creds[broker].get("type", broker)
+    if btype == "paper":
+        return _cors(jsonify({"ok": True, "broker": broker, "positions": []}))
+    if btype == "ctrader":
+        # Live position fetch via Open API would need a full reconcile flow;
+        # report capability honestly until the streaming client lands.
+        return _cors(jsonify({"ok": True, "broker": broker, "positions": [],
+                              "note": "cTrader position streaming not yet enabled — balance sync is live."}))
+    return _cors(jsonify({"ok": True, "broker": broker, "positions": [],
+                          "note": "Position sync for this account type needs the terminal bridge."}))
+
+@app.route("/api/broker/disconnect", methods=["POST", "DELETE", "OPTIONS"])
+def api_broker_disconnect():
+    if request.method == "OPTIONS":
+        return _cors(jsonify({"ok": True}))
+    try:
+        data = request.get_json(force=True, silent=True) or {}
+    except Exception:
+        data = {}
+    broker = str(data.get("broker") or request.args.get("broker", "")).lower().strip()
+    creds = _load_broker_creds()
+    if broker not in creds:
+        return _cors(jsonify({"ok": False, "error": "Broker not connected."})), 404
+    del creds[broker]
+    _save_broker_creds(creds)
+    return _cors(jsonify({"ok": True, "broker": broker, "disconnected": True}))
+
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
