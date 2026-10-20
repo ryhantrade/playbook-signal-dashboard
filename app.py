@@ -516,6 +516,162 @@ def api_candles():
                           "source": source, "count": len(bars),
                           "bars": bars}))
 
+# --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
+# The Charting Library talks to a UDF-compatible server: /udf/config,
+# /udf/time, /udf/symbols, /udf/search, /udf/history. Bars come from the
+# same _fetch_candles() pipeline as /api/candles (TradingView primary,
+# yfinance fallback, 15-minute server cache) — no separate fetch path.
+UDF_RESOLUTIONS = ["1", "5", "15", "30", "60", "240", "D"]
+_UDF_RES_ALIASES = {"1D": "D", "1440": "D", "D": "D"}
+
+_UDF_CUR_NAMES = {"EUR": "Euro", "GBP": "British Pound", "USD": "US Dollar",
+                  "JPY": "Japanese Yen", "AUD": "Australian Dollar",
+                  "NZD": "New Zealand Dollar", "CAD": "Canadian Dollar",
+                  "CHF": "Swiss Franc"}
+_UDF_DESCR = {
+    "BTCUSD": "Bitcoin / US Dollar", "ETHUSD": "Ethereum / US Dollar",
+    "SOLUSD": "Solana / US Dollar", "XRPUSD": "Ripple / US Dollar",
+    "XAUUSD": "Gold (spot) / US Dollar", "XAGUSD": "Silver (spot) / US Dollar",
+    "US30": "Dow Jones Industrial Average", "NAS100": "Nasdaq 100 Index",
+    "SPX500": "S&P 500 Index",
+    "BTC": "Bitcoin / US Dollar", "ETH": "Ethereum / US Dollar",
+    "SOL": "Solana / US Dollar", "XRP": "Ripple / US Dollar",
+    "GOLD": "Gold (spot) / US Dollar",
+}
+
+def _udf_sym_type(sym):
+    if sym in ("XAUUSD", "XAGUSD", "GOLD"):
+        return "metal"
+    if sym in ("BTCUSD", "ETHUSD", "SOLUSD", "XRPUSD",
+               "BTC", "ETH", "SOL", "XRP"):
+        return "crypto"
+    if sym in ("US30", "NAS100", "SPX500"):
+        return "index"
+    return "forex"
+
+def _udf_sym_descr(sym):
+    if sym in _UDF_DESCR:
+        return _UDF_DESCR[sym]
+    if len(sym) == 6:  # forex pair: BASE + QUOTE currency codes
+        return (_UDF_CUR_NAMES.get(sym[:3], sym[:3]) + " / " +
+                _UDF_CUR_NAMES.get(sym[3:], sym[3:]))
+    return sym
+
+def _udf_pricescale(sym):
+    if _udf_sym_type(sym) == "forex":
+        return 1000 if "JPY" in sym else 100000
+    return 100
+
+def _udf_symbol_info(sym):
+    return {"name": sym, "ticker": sym,
+            "description": _udf_sym_descr(sym),
+            "type": _udf_sym_type(sym),
+            "session": "24x7", "timezone": "Etc/UTC",
+            "exchange": "TM", "listed_exchange": "TM",
+            "minmov": 1, "pricescale": _udf_pricescale(sym),
+            "has_intraday": True, "has_daily": True,
+            "supported_resolutions": UDF_RESOLUTIONS,
+            "volume_precision": 2, "data_status": "streaming",
+            "force_session_rebuild": False, "has_no_volume": False}
+
+# The UDF symbol universe is exactly what /api/candles supports.
+UDF_SYMBOLS = {sym: _udf_symbol_info(sym) for sym in YF_SYM_MAP}
+
+def _udf_clean_symbol(raw):
+    s = (raw or "").upper().strip()
+    if ":" in s:  # tolerate "TM:EURUSD" style full names
+        s = s.rsplit(":", 1)[-1]
+    return s
+
+@app.route("/udf/config")
+def udf_config():
+    return _cors(jsonify({
+        "supports_search": True, "supports_group_request": False,
+        "supports_marks": False, "supports_timescale_marks": False,
+        "supports_time": True,
+        "exchanges": [{"value": "TM", "name": "TM", "desc": "TradeMind"}],
+        "symbols_types": [{"name": "All", "value": ""}],
+        "supported_resolutions": UDF_RESOLUTIONS}))
+
+@app.route("/udf/time")
+def udf_time():
+    return _cors(Response(str(int(time.time())), mimetype="text/plain"))
+
+@app.route("/udf/symbols")
+def udf_symbols():
+    sym = _udf_clean_symbol(request.args.get("symbol", ""))
+    info = UDF_SYMBOLS.get(sym)
+    if info is None:
+        resp = jsonify({"s": "error", "errmsg": "unknown symbol: " + sym})
+        resp.status_code = 404
+        return _cors(resp)
+    return _cors(jsonify(info))
+
+@app.route("/udf/search")
+def udf_search():
+    q = (request.args.get("query", "") or "").upper().strip()
+    try:
+        limit = int(request.args.get("limit", 30))
+    except Exception:
+        limit = 30
+    out = []
+    for sym, info in UDF_SYMBOLS.items():
+        if not q or q in sym or q in info["description"].upper():
+            out.append({"symbol": sym, "full_name": "TM:" + sym,
+                        "description": info["description"],
+                        "exchange": "TM", "ticker": sym,
+                        "type": info["type"]})
+        if len(out) >= max(1, limit):
+            break
+    return _cors(jsonify(out))
+
+@app.route("/udf/history")
+def udf_history():
+    sym = _udf_clean_symbol(request.args.get("symbol", ""))
+    if sym not in UDF_SYMBOLS:
+        return _cors(jsonify({"s": "error",
+                              "errmsg": "unknown symbol: " + sym}))
+    res = (request.args.get("resolution", "15") or "15").strip()
+    res = _UDF_RES_ALIASES.get(res, res)
+    if res not in TV_RES_MAP:
+        return _cors(jsonify({"s": "error",
+                              "errmsg": "unsupported resolution: " + res}))
+    try:
+        to_ts = int(request.args.get("to", int(time.time())))
+    except Exception:
+        to_ts = int(time.time())
+    try:
+        from_ts = int(request.args.get("from", 0))
+    except Exception:
+        from_ts = 0
+    countback = request.args.get("countback")
+    try:
+        countback = int(countback) if countback is not None else None
+    except Exception:
+        countback = None
+    bars, _src, err = _fetch_candles(sym, res)
+    if not bars:
+        if err:
+            return _cors(jsonify({"s": "error", "errmsg": err}))
+        return _cors(jsonify({"s": "no_data"}))
+    if countback is not None:
+        # UDF countback semantics: the last N bars up to `to`
+        # (`from` is ignored when countback is present).
+        sel = [b for b in bars if b["time"] <= to_ts][-max(1, countback):]
+    else:
+        sel = [b for b in bars if from_ts <= b["time"] <= to_ts]
+    if not sel:
+        return _cors(jsonify({"s": "no_data"}))
+    # The candle pipeline carries no volume; UDF still expects the array.
+    return _cors(jsonify({
+        "s": "ok",
+        "t": [b["time"] for b in sel],
+        "o": [b["open"] for b in sel],
+        "h": [b["high"] for b in sel],
+        "l": [b["low"] for b in sel],
+        "c": [b["close"] for b in sel],
+        "v": [0] * len(sel)}))
+
 # --- Broker connect / integration system (for TradeMind) ---
 # Real account connections: Paper (built-in), cTrader (Open API),
 # MT5 (credential vault, live sync via terminal bridge),
