@@ -237,6 +237,275 @@ def api_forex_calendar():
     resp.headers["Access-Control-Allow-Origin"] = "*"
     return resp
 
+# --- OHLC candles proxy (for TradeMind chart) ---
+# GET /api/candles?market=BTCUSD&tf=15 -> {"ok":true,"source":...,"bars":[...]}
+# PRIMARY source: TradingView's own chart datafeed (anonymous websocket
+# session — the same protocol open-source tvdatafeed clients use), so the
+# candles come from exactly the market data the user sees on TradingView.
+# FALLBACK: yfinance, applied automatically on ANY TradingView failure
+# (unreachable / throttled / bad data). The response always reports which
+# source served the bars ("source": "tradingview" | "yfinance").
+# Needs websocket-client (already in requirements.txt).
+_candle_cache = {}  # (market, tf) -> {"fetched_at": ts, "bars": [...], "source": str}
+
+TV_SYM_MAP = {
+    "BTCUSD": "BINANCE:BTCUSDT", "ETHUSD": "BINANCE:ETHUSDT",
+    "SOLUSD": "BINANCE:SOLUSDT", "XRPUSD": "BINANCE:XRPUSDT",
+    "XAUUSD": "OANDA:XAUUSD", "XAGUSD": "OANDA:XAGUSD",
+    "EURUSD": "FX:EURUSD", "GBPUSD": "FX:GBPUSD", "USDJPY": "FX:USDJPY",
+    "AUDUSD": "FX:AUDUSD", "NZDUSD": "FX:NZDUSD", "USDCAD": "FX:USDCAD",
+    "USDCHF": "FX:USDCHF", "EURJPY": "FX:EURJPY", "GBPJPY": "FX:GBPJPY",
+    "EURGBP": "FX:EURGBP", "EURAUD": "FX:EURAUD", "AUDJPY": "FX:AUDJPY",
+    "GBPAUD": "FX:GBPAUD", "AUDCAD": "FX:AUDCAD", "EURCAD": "FX:EURCAD",
+    "GBPCAD": "FX:GBPCAD",
+    "US30": "DJ:DJI", "NAS100": "NASDAQ:NDX", "SPX500": "SP:SPX",
+    # scanner-name aliases
+    "BTC": "BINANCE:BTCUSDT", "ETH": "BINANCE:ETHUSDT",
+    "SOL": "BINANCE:SOLUSDT", "XRP": "BINANCE:XRPUSDT", "GOLD": "OANDA:XAUUSD",
+}
+
+# frontend tf value -> (TradingView resolution, seconds per bar)
+TV_RES_MAP = {
+    "1": ("1", 60), "5": ("5", 300), "15": ("15", 900), "30": ("30", 1800),
+    "60": ("60", 3600), "240": ("240", 14400), "D": ("D", 86400), "W": ("W", 604800),
+    "1m": ("1", 60), "5m": ("5", 300), "15m": ("15", 900), "30m": ("30", 1800),
+    "1h": ("60", 3600), "4h": ("240", 14400), "1d": ("D", 86400), "1w": ("W", 604800),
+}
+
+YF_SYM_MAP = {
+    "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD", "SOLUSD": "SOL-USD",
+    "XRPUSD": "XRP-USD", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
+    "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
+    "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X", "USDCAD": "CAD=X",
+    "USDCHF": "CHF=X", "EURJPY": "EURJPY=X", "GBPJPY": "GBPJPY=X",
+    "EURGBP": "EURGBP=X", "EURAUD": "EURAUD=X", "AUDJPY": "AUDJPY=X",
+    "GBPAUD": "GBPAUD=X", "AUDCAD": "AUDCAD=X", "EURCAD": "EURCAD=X",
+    "GBPCAD": "GBPCAD=X",
+    "US30": "^DJI", "NAS100": "^NDX", "SPX500": "^SPX",
+    "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
+    "XRP": "XRP-USD", "GOLD": "GC=F",
+}
+
+# frontend tf value -> (yfinance interval, yfinance period)
+YF_TF_MAP = {
+    "1": ("1m", "1d"), "5": ("5m", "5d"), "15": ("15m", "60d"),
+    "30": ("30m", "60d"), "60": ("1h", "730d"), "240": ("1h", "730d"),
+    "D": ("1d", "5y"), "W": ("1wk", "max"),
+    "1m": ("1m", "1d"), "5m": ("5m", "5d"), "15m": ("15m", "60d"),
+    "30m": ("30m", "60d"), "1h": ("1h", "730d"), "4h": ("1h", "730d"),
+    "1d": ("1d", "5y"), "1w": ("1wk", "max"),
+}
+
+def _tv_fetch_bars(tv_symbol, resolution, res_secs, n_bars=300, total_timeout=16):
+    """Fetch OHLC bars from TradingView's anonymous chart datafeed websocket
+    (set_auth_token 'unauthorized_user_token' + chart create_series — the
+    tvdatafeed protocol). Returns (bars, error); bars are
+    [{"time","open","high","low","close"}] sorted by time."""
+    try:
+        import websocket as _wsc
+    except ImportError:
+        return None, "websocket-client not installed"
+    import json as _json, random as _rnd, re as _re, string as _str, time as _tm
+
+    def _gen(prefix):
+        return prefix + "_" + "".join(_rnd.choice(_str.ascii_lowercase)
+                                      for _ in range(12))
+
+    def _send(ws, m, p):
+        msg = _json.dumps({"m": m, "p": p}, separators=(",", ":"))
+        ws.send("~m~" + str(len(msg)) + "~m~" + msg)
+
+    try:
+        ws = _wsc.create_connection(
+            "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&date=2024_05_01-11_02",
+            timeout=8)
+    except Exception as e:
+        return None, "tv connect failed: " + str(e)[:120]
+
+    chart_session = _gen("cs")
+    try:
+        _send(ws, "set_auth_token", ["unauthorized_user_token"])
+        _send(ws, "chart_create_session", [chart_session, ""])
+        _send(ws, "resolve_symbol",
+              [chart_session, "sym_1",
+               '={"symbol":"' + tv_symbol + '","adjustment":"splits"}'])
+        _send(ws, "create_series",
+              [chart_session, "s1", "s1", "sym_1", resolution, n_bars])
+    except Exception as e:
+        try:
+            ws.close()
+        except Exception:
+            pass
+        return None, "tv send failed: " + str(e)[:120]
+
+    bars = {}  # time -> [open, high, low, close]
+    done = False
+    try:
+        buf = ""
+        deadline = _tm.time() + total_timeout
+        while not done and _tm.time() < deadline:
+            try:
+                ws.settimeout(max(1.0, deadline - _tm.time()))
+                chunk = ws.recv()
+            except Exception:
+                break
+            if isinstance(chunk, bytes):
+                continue
+            buf += chunk
+            # split length-prefixed frames: ~m~<len>~m~<payload>
+            while True:
+                m = _re.match(r"~m~(\d+)~m~", buf)
+                if not m:
+                    break
+                n = int(m.group(1))
+                start = m.end()
+                if len(buf) < start + n:
+                    break
+                raw = buf[start:start + n]
+                buf = buf[start + n:]
+                if raw.startswith("~h~"):
+                    # heartbeat ping — echo it back framed
+                    try:
+                        ws.send("~m~" + str(len(raw)) + "~m~" + raw)
+                    except Exception:
+                        pass
+                    continue
+                try:
+                    msg = _json.loads(raw)
+                except Exception:
+                    continue
+                meth = msg.get("m")
+                p = msg.get("p") or []
+                if meth == "timescale_update" and p and p[0] == "s1":
+                    data = p[1] if len(p) > 1 else {}
+                    base_t = data.get("t")
+                    if isinstance(base_t, (list, tuple)):
+                        base_t = base_t[0] if base_t else None
+                    if base_t is None:
+                        continue
+                    for series in (data.get("s") or []):
+                        for c in (series.get("v") or []):
+                            try:
+                                t = int(base_t) + int(c[0]) * res_secs
+                                bars[t] = [float(c[1]), float(c[2]),
+                                           float(c[3]), float(c[4])]
+                            except Exception:
+                                continue
+                elif meth == "series_completed" and p and p[0] == "s1":
+                    done = True
+                    break
+                elif meth in ("series_error", "symbol_error"):
+                    try:
+                        ws.close()
+                    except Exception:
+                        pass
+                    return None, "tv error: " + str(p)[:150]
+    finally:
+        try:
+            ws.close()
+        except Exception:
+            pass
+
+    if not bars:
+        return None, "tv returned no candles"
+    out = [{"time": t, "open": b[0], "high": b[1], "low": b[2], "close": b[3]}
+           for t, b in sorted(bars.items())]
+    return out[-500:], None
+
+def _bars_sane(bars):
+    """Guard against a protocol quirk serving garbage: require a plausible
+    last-bar time and a minimum bar count, else the caller falls back."""
+    try:
+        last = bars[-1]["time"]
+        return 1577836800 < last < time.time() + 3600 and len(bars) >= 5
+    except Exception:
+        return False
+
+def _yf_fetch_bars(market, tf_key):
+    """yfinance fallback. Returns (bars, error)."""
+    sym = YF_SYM_MAP.get(market.upper())
+    if not sym:
+        return None, "unsupported market for fallback"
+    spec = YF_TF_MAP.get(tf_key)
+    if not spec:
+        return None, "unsupported tf for fallback"
+    interval, period = spec
+    try:
+        import yfinance as _yf
+        import pandas as _pd
+        d = _yf.download(sym, period=period, interval=interval,
+                         progress=False, auto_adjust=False)
+        if d is None or getattr(d, "empty", True):
+            return None, "yfinance returned no data"
+        if isinstance(d.columns, _pd.MultiIndex):
+            d.columns = [c[0].lower() for c in d.columns]
+        else:
+            d.columns = [str(c).lower() for c in d.columns]
+        df = d[["open", "high", "low", "close"]].dropna()
+        if tf_key in ("240", "4h"):
+            # no native 4h interval in yfinance — aggregate the 1h bars
+            df = df.resample("4h", origin="start").agg(
+                {"open": "first", "high": "max",
+                 "low": "min", "close": "last"}).dropna()
+        bars = [{"time": int(ts.timestamp()),
+                 "open": round(float(r["open"]), 5),
+                 "high": round(float(r["high"]), 5),
+                 "low": round(float(r["low"]), 5),
+                 "close": round(float(r["close"]), 5)}
+                for ts, r in df.tail(500).iterrows()]
+        if not bars:
+            return None, "yfinance returned no data"
+        return bars, None
+    except Exception as e:
+        return None, "yfinance error: " + str(e)[:150]
+
+def _fetch_candles(market, tf):
+    """Returns (bars, source, error). TradingView first, yfinance fallback;
+    5-minute server cache per market+tf."""
+    market = (market or "").upper().strip()
+    tf_key = (tf or "15").strip()
+    resolution, res_secs = TV_RES_MAP.get(tf_key, TV_RES_MAP["15"])
+    key = (market, tf_key)
+    now = time.time()
+    hit = _candle_cache.get(key)
+    if hit and now - hit["fetched_at"] < 300 and hit["bars"]:
+        return hit["bars"], hit.get("source"), None
+    bars, source, err = None, None, None
+    tv_symbol = TV_SYM_MAP.get(market)
+    if tv_symbol:
+        tb, terr = _tv_fetch_bars(tv_symbol, resolution, res_secs)
+        if tb and _bars_sane(tb):
+            bars, source = tb, "tradingview"
+        else:
+            err = terr or "tv data failed sanity check"
+    yb, yerr = (None, None)
+    if bars is None:
+        yb, yerr = _yf_fetch_bars(market, tf_key)
+        if yb:
+            bars, source, err = yb, "yfinance", None
+        elif yerr:
+            err = ((err + "; ") if err else "") + yerr
+    if bars is None:
+        return None, None, err or "no candle data available"
+    _candle_cache[key] = {"fetched_at": now, "bars": bars, "source": source}
+    return bars, source, None
+
+@app.route("/api/candles")
+def api_candles():
+    market = request.args.get("market") or request.args.get("symbol", "")
+    tf = request.args.get("tf", "15")
+    if not market:
+        return _cors(jsonify({"ok": False, "error": "market required"})), 400
+    bars, source, err = _fetch_candles(market, tf)
+    if err:
+        resp = jsonify({"ok": False, "market": market.upper(),
+                        "tf": tf, "error": err})
+        resp.status_code = 502
+        return _cors(resp)
+    return _cors(jsonify({"ok": True, "market": market.upper(), "tf": tf,
+                          "source": source, "count": len(bars),
+                          "bars": bars}))
+
 # --- Broker connect / integration system (for TradeMind) ---
 # Real account connections: Paper (built-in), cTrader (Open API),
 # MT5 (credential vault, live sync via terminal bridge),
