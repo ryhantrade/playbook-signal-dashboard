@@ -247,6 +247,7 @@ def api_forex_calendar():
 # source served the bars ("source": "tradingview" | "yfinance").
 # Needs websocket-client (already in requirements.txt).
 _candle_cache = {}  # (market, tf) -> {"fetched_at": ts, "bars": [...], "source": str}
+_tv_fail_until = {}  # tv_symbol -> ts until which TradingView is skipped (negative cache)
 
 TV_SYM_MAP = {
     "BTCUSD": "BINANCE:BTCUSDT", "ETHUSD": "BINANCE:ETHUSDT",
@@ -272,9 +273,13 @@ TV_RES_MAP = {
     "1h": ("60", 3600), "4h": ("240", 14400), "1d": ("D", 86400), "1w": ("W", 604800),
 }
 
+# NOTE: XAUUSD/GOLD use PAXG-USD (PAX Gold token), NOT GC=F futures — the
+# TradeMind app prices live gold from CoinGecko pax-gold (spot), so the
+# candles must be the same asset or the forming candle / position lines
+# sit visibly off the candle bodies by the futures-spot spread.
 YF_SYM_MAP = {
     "BTCUSD": "BTC-USD", "ETHUSD": "ETH-USD", "SOLUSD": "SOL-USD",
-    "XRPUSD": "XRP-USD", "XAUUSD": "GC=F", "XAGUSD": "SI=F",
+    "XRPUSD": "XRP-USD", "XAUUSD": "PAXG-USD", "XAGUSD": "SI=F",
     "EURUSD": "EURUSD=X", "GBPUSD": "GBPUSD=X", "USDJPY": "JPY=X",
     "AUDUSD": "AUDUSD=X", "NZDUSD": "NZDUSD=X", "USDCAD": "CAD=X",
     "USDCHF": "CHF=X", "EURJPY": "EURJPY=X", "GBPJPY": "GBPJPY=X",
@@ -283,20 +288,20 @@ YF_SYM_MAP = {
     "GBPCAD": "GBPCAD=X",
     "US30": "^DJI", "NAS100": "^NDX", "SPX500": "^SPX",
     "BTC": "BTC-USD", "ETH": "ETH-USD", "SOL": "SOL-USD",
-    "XRP": "XRP-USD", "GOLD": "GC=F",
+    "XRP": "XRP-USD", "GOLD": "PAXG-USD",
 }
 
 # frontend tf value -> (yfinance interval, yfinance period)
 YF_TF_MAP = {
-    "1": ("1m", "1d"), "5": ("5m", "5d"), "15": ("15m", "60d"),
-    "30": ("30m", "60d"), "60": ("1h", "730d"), "240": ("1h", "730d"),
-    "D": ("1d", "5y"), "W": ("1wk", "max"),
-    "1m": ("1m", "1d"), "5m": ("5m", "5d"), "15m": ("15m", "60d"),
-    "30m": ("30m", "60d"), "1h": ("1h", "730d"), "4h": ("1h", "730d"),
-    "1d": ("1d", "5y"), "1w": ("1wk", "max"),
+    "1": ("1m", "1d"), "5": ("5m", "5d"), "15": ("15m", "21d"),
+    "30": ("30m", "21d"), "60": ("1h", "120d"), "240": ("1h", "120d"),
+    "D": ("1d", "2y"), "W": ("1wk", "5y"),
+    "1m": ("1m", "1d"), "5m": ("5m", "5d"), "15m": ("15m", "21d"),
+    "30m": ("30m", "21d"), "1h": ("1h", "120d"), "4h": ("1h", "120d"),
+    "1d": ("1d", "2y"), "1w": ("1wk", "5y"),
 }
 
-def _tv_fetch_bars(tv_symbol, resolution, res_secs, n_bars=300, total_timeout=16):
+def _tv_fetch_bars(tv_symbol, resolution, res_secs, n_bars=300, total_timeout=3.5):
     """Fetch OHLC bars from TradingView's anonymous chart datafeed websocket
     (set_auth_token 'unauthorized_user_token' + chart create_series — the
     tvdatafeed protocol). Returns (bars, error); bars are
@@ -318,7 +323,7 @@ def _tv_fetch_bars(tv_symbol, resolution, res_secs, n_bars=300, total_timeout=16
     try:
         ws = _wsc.create_connection(
             "wss://data.tradingview.com/socket.io/websocket?from=chart%2F&date=2024_05_01-11_02",
-            timeout=8)
+            timeout=3)
     except Exception as e:
         return None, "tv connect failed: " + str(e)[:120]
 
@@ -443,8 +448,9 @@ def _yf_fetch_bars(market, tf_key):
             d.columns = [str(c).lower() for c in d.columns]
         df = d[["open", "high", "low", "close"]].dropna()
         if tf_key in ("240", "4h"):
-            # no native 4h interval in yfinance — aggregate the 1h bars
-            df = df.resample("4h", origin="start").agg(
+            # no native 4h interval in yfinance — aggregate the 1h bars,
+            # anchored to UTC day start so bins are 00/04/08/12/16/20h
+            df = df.resample("4h", origin="start_day").agg(
                 {"open": "first", "high": "max",
                  "low": "min", "close": "last"}).dropna()
         bars = [{"time": int(ts.timestamp()),
@@ -460,24 +466,28 @@ def _yf_fetch_bars(market, tf_key):
         return None, "yfinance error: " + str(e)[:150]
 
 def _fetch_candles(market, tf):
-    """Returns (bars, source, error). TradingView first, yfinance fallback;
-    5-minute server cache per market+tf."""
+    """Returns (bars, source, error). TradingView first (short timeout +
+    20-minute per-symbol negative cache on failure — anonymous TV sessions
+    are unreliable from server egress, so a dead TV must not stall every
+    cache miss), yfinance fallback; 15-minute server cache per market+tf."""
     market = (market or "").upper().strip()
     tf_key = (tf or "15").strip()
     resolution, res_secs = TV_RES_MAP.get(tf_key, TV_RES_MAP["15"])
     key = (market, tf_key)
     now = time.time()
     hit = _candle_cache.get(key)
-    if hit and now - hit["fetched_at"] < 300 and hit["bars"]:
+    if hit and now - hit["fetched_at"] < 900 and hit["bars"]:
         return hit["bars"], hit.get("source"), None
     bars, source, err = None, None, None
     tv_symbol = TV_SYM_MAP.get(market)
-    if tv_symbol:
+    if tv_symbol and now >= _tv_fail_until.get(tv_symbol, 0):
         tb, terr = _tv_fetch_bars(tv_symbol, resolution, res_secs)
         if tb and _bars_sane(tb):
             bars, source = tb, "tradingview"
+            _tv_fail_until.pop(tv_symbol, None)
         else:
             err = terr or "tv data failed sanity check"
+            _tv_fail_until[tv_symbol] = now + 1200
     yb, yerr = (None, None)
     if bars is None:
         yb, yerr = _yf_fetch_bars(market, tf_key)
