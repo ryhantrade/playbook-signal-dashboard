@@ -473,14 +473,15 @@ def _fetch_candles(market, tf):
 
     NOTE: the cache MUST stay short. The Charting Library polls /udf/history
     every 10s for the forming bar; a 15-minute cache meant the current bar
-    never moved during its whole life on a 15m chart (frozen chart)."""
+    never moved during its whole life on a 15m chart (frozen chart). 10s
+    matches the widget poll rate so the bar moves live."""
     market = (market or "").upper().strip()
     tf_key = (tf or "15").strip()
     resolution, res_secs = TV_RES_MAP.get(tf_key, TV_RES_MAP["15"])
     key = (market, tf_key)
     now = time.time()
     hit = _candle_cache.get(key)
-    if hit and now - hit["fetched_at"] < 60 and hit["bars"]:
+    if hit and now - hit["fetched_at"] < 10 and hit["bars"]:
         return hit["bars"], hit.get("source"), None
     bars, source, err = None, None, None
     tv_symbol = TV_SYM_MAP.get(market)
