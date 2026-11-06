@@ -550,9 +550,12 @@ def api_candles():
 # froze whenever CoinGecko lagged/rate-limited, and forex never moved
 # intraday (er-api is daily rates). Quotes come from the same candle
 # pipeline as the chart, so the watchlist and the chart agree and move
-# together. 15s server cache keeps Yahoo load sane; the frontend polls
-# every 5s and gets the cached quotes in between.
-_quotes_cache = {"fetched_at": 0, "quotes": {}}
+# together. The refresh runs SEQUENTIALLY in ONE background thread:
+# yfinance is not thread-safe, and a ThreadPoolExecutor calling it from
+# 8 threads crashed the worker (503s, and the chart showed "This symbol
+# doesn't exist"). The endpoint always answers instantly from cache
+# (30s TTL); a stale cache triggers a background refresh, never a block.
+_quotes_cache = {"fetched_at": 0, "quotes": {}, "refreshing": False}
 _QUOTE_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
                   "USDCAD", "USDCHF", "EURJPY", "GBPJPY", "EURGBP",
                   "EURAUD", "AUDJPY", "GBPAUD", "AUDCAD", "EURCAD",
@@ -562,7 +565,7 @@ _QUOTE_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
 def _one_quote(sym):
     bars, _src, err = _fetch_candles(sym, "15")
     if not bars:
-        return sym, None
+        return None
     last = bars[-1]
     price = last["close"]
     day_start = int(datetime.now(timezone.utc).replace(
@@ -575,27 +578,31 @@ def _one_quote(sym):
     if day_open is None:
         day_open = bars[0]["open"]
     chg = (price - day_open) / day_open * 100 if day_open else 0
-    return sym, {"price": round(price, 5), "chg": round(chg, 3)}
+    return {"price": round(price, 5), "chg": round(chg, 3)}
+
+def _refresh_quotes_bg():
+    quotes = dict(_quotes_cache["quotes"])
+    for sym in _QUOTE_SYMBOLS:
+        try:
+            q = _one_quote(sym)
+            if q:
+                quotes[sym] = q
+        except Exception:
+            pass
+    _quotes_cache["fetched_at"] = time.time()
+    _quotes_cache["quotes"] = quotes
+    _quotes_cache["refreshing"] = False
 
 @app.route("/api/quotes")
 def api_quotes():
     now = time.time()
-    if (now - _quotes_cache["fetched_at"] < 15
-            and _quotes_cache["quotes"]):
-        return _cors(jsonify({"ok": True, "quotes": _quotes_cache["quotes"]}))
-    from concurrent.futures import ThreadPoolExecutor
-    quotes = dict(_quotes_cache["quotes"])
-    try:
-        with ThreadPoolExecutor(max_workers=8) as ex:
-            for sym, q in ex.map(_one_quote, _QUOTE_SYMBOLS):
-                if q:
-                    quotes[sym] = q
-    except Exception:
-        pass
-    if quotes:
-        _quotes_cache["fetched_at"] = now
-        _quotes_cache["quotes"] = quotes
-    return _cors(jsonify({"ok": bool(quotes), "quotes": quotes}))
+    if (now - _quotes_cache["fetched_at"] >= 30
+            and not _quotes_cache["refreshing"]):
+        _quotes_cache["refreshing"] = True
+        import threading
+        threading.Thread(target=_refresh_quotes_bg, daemon=True).start()
+    return _cors(jsonify({"ok": bool(_quotes_cache["quotes"]),
+                          "quotes": _quotes_cache["quotes"]}))
 
 # --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
 # The Charting Library talks to a UDF-compatible server: /udf/config,
