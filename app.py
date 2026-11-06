@@ -667,15 +667,16 @@ def udf_history():
         sel = [b for b in bars if from_ts <= b["time"] <= to_ts]
     if not sel:
         return _cors(jsonify({"s": "no_data"}))
-    # The candle pipeline carries no volume; UDF still expects the array.
+    # No volume array: the candle pipeline carries no real volume, and
+    # sending v=[0,...] made the Charting Library auto-show an empty
+    # Volume pane. Omitting "v" keeps Volume off unless the user adds it.
     return _cors(jsonify({
         "s": "ok",
         "t": [b["time"] for b in sel],
         "o": [b["open"] for b in sel],
         "h": [b["high"] for b in sel],
         "l": [b["low"] for b in sel],
-        "c": [b["close"] for b in sel],
-        "v": [0] * len(sel)}))
+        "c": [b["close"] for b in sel]}))
 
 # --- Broker connect / integration system (for TradeMind) ---
 # Real account connections: Paper (built-in), cTrader (Open API),
