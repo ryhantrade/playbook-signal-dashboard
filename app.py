@@ -502,6 +502,30 @@ def _fetch_candles(market, tf):
             err = ((err + "; ") if err else "") + yerr
     if bars is None:
         return None, None, err or "no candle data available"
+    # Repair a degenerate forming bar: yfinance returns the current
+    # incomplete bar as O=H=L=C=last price, so the Charting Library drew
+    # a zero-height body until the bar closed. Rebuild it from the
+    # previous close so the body renders live; carry the wider high/low
+    # seen so far in this bar from the cached copy.
+    try:
+        if len(bars) >= 2:
+            last, prev = bars[-1], bars[-2]
+            period_start = int(now // res_secs) * res_secs
+            if (last["time"] == period_start
+                    and last["open"] == last["high"] == last["low"] == last["close"]):
+                p, o = last["close"], prev["close"]
+                last["open"] = o
+                last["high"] = max(o, p)
+                last["low"] = min(o, p)
+                last["close"] = p
+                cached = (_candle_cache.get(key) or {}).get("bars") or []
+                if cached and cached[-1]["time"] == last["time"]:
+                    cl = cached[-1]
+                    last["open"] = cl["open"]
+                    last["high"] = max(last["high"], cl["high"])
+                    last["low"] = min(last["low"], cl["low"])
+    except Exception:
+        pass
     _candle_cache[key] = {"fetched_at": now, "bars": bars, "source": source}
     return bars, source, None
 
