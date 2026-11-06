@@ -545,6 +545,58 @@ def api_candles():
                           "source": source, "count": len(bars),
                           "bars": bars}))
 
+# --- Live quotes for the TradeMind watchlist (one call, all symbols) ---
+# The watchlist used to poll CoinGecko + er-api from the browser: crypto
+# froze whenever CoinGecko lagged/rate-limited, and forex never moved
+# intraday (er-api is daily rates). Quotes come from the same candle
+# pipeline as the chart, so the watchlist and the chart agree and move
+# together. 15s server cache keeps Yahoo load sane; the frontend polls
+# every 5s and gets the cached quotes in between.
+_quotes_cache = {"fetched_at": 0, "quotes": {}}
+_QUOTE_SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "AUDUSD", "NZDUSD",
+                  "USDCAD", "USDCHF", "EURJPY", "GBPJPY", "EURGBP",
+                  "EURAUD", "AUDJPY", "GBPAUD", "AUDCAD", "EURCAD",
+                  "GBPCAD", "US30", "NAS100", "SPX500", "BTCUSD",
+                  "ETHUSD", "SOLUSD", "XRPUSD", "XAUUSD", "XAGUSD"]
+
+def _one_quote(sym):
+    bars, _src, err = _fetch_candles(sym, "15")
+    if not bars:
+        return sym, None
+    last = bars[-1]
+    price = last["close"]
+    day_start = int(datetime.now(timezone.utc).replace(
+        hour=0, minute=0, second=0, microsecond=0).timestamp())
+    day_open = None
+    for b in bars:
+        if b["time"] >= day_start:
+            day_open = b["open"]
+            break
+    if day_open is None:
+        day_open = bars[0]["open"]
+    chg = (price - day_open) / day_open * 100 if day_open else 0
+    return sym, {"price": round(price, 5), "chg": round(chg, 3)}
+
+@app.route("/api/quotes")
+def api_quotes():
+    now = time.time()
+    if (now - _quotes_cache["fetched_at"] < 15
+            and _quotes_cache["quotes"]):
+        return _cors(jsonify({"ok": True, "quotes": _quotes_cache["quotes"]}))
+    from concurrent.futures import ThreadPoolExecutor
+    quotes = dict(_quotes_cache["quotes"])
+    try:
+        with ThreadPoolExecutor(max_workers=8) as ex:
+            for sym, q in ex.map(_one_quote, _QUOTE_SYMBOLS):
+                if q:
+                    quotes[sym] = q
+    except Exception:
+        pass
+    if quotes:
+        _quotes_cache["fetched_at"] = now
+        _quotes_cache["quotes"] = quotes
+    return _cors(jsonify({"ok": bool(quotes), "quotes": quotes}))
+
 # --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
 # The Charting Library talks to a UDF-compatible server: /udf/config,
 # /udf/time, /udf/symbols, /udf/search, /udf/history. Bars come from the
