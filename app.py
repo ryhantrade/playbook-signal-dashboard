@@ -172,6 +172,105 @@ try:
 except Exception:
     def _unescape(s): return s
 
+def _ff_et_label(dateline):
+    """UTC epoch -> US Eastern wall-time label like '8:30am' (for old frontends).
+    Manual US DST rule (2nd Sun Mar 07:00 UTC -> 1st Sun Nov 06:00 UTC);
+    no tzdata dependency so it works on any Render image."""
+    import datetime as _dt
+    dt = _dt.datetime.fromtimestamp(dateline, tz=_dt.timezone.utc)
+    def _nth_sunday(year, month, n):
+        d = _dt.date(year, month, 1)
+        return d + _dt.timedelta(days=(6 - d.weekday()) % 7 + 7 * (n - 1))
+    dst_start = _dt.datetime.combine(_nth_sunday(dt.year, 3, 2), _dt.time(7, 0), tzinfo=_dt.timezone.utc)
+    dst_end = _dt.datetime.combine(_nth_sunday(dt.year, 11, 1), _dt.time(6, 0), tzinfo=_dt.timezone.utc)
+    off = -4 if dst_start <= dt < dst_end else -5
+    et = dt + _dt.timedelta(hours=off)
+    h = et.hour % 12 or 12
+    return "%d:%02d%s" % (h, et.minute, "am" if et.hour < 12 else "pm")
+
+
+def _ff_extract_bracketed(html, marker, open_c, close_c):
+    """Quote-aware bracket extraction: returns the [...] / {...} starting
+    just after `marker`, or None. Handles ' and " strings with escapes."""
+    s = html.find(marker)
+    if s < 0:
+        return None
+    s = html.find(open_c, s + len(marker))
+    if s < 0:
+        return None
+    depth = 0
+    quote = None
+    esc = False
+    i = s
+    while i < len(html):
+        c = html[i]
+        if quote:
+            if esc:
+                esc = False
+            elif c == "\\":
+                esc = True
+            elif c == quote:
+                quote = None
+        else:
+            if c in ("\"", "'"):
+                quote = c
+            elif c == open_c:
+                depth += 1
+            elif c == close_c:
+                depth -= 1
+                if depth == 0:
+                    return html[s:i + 1]
+        i += 1
+    return None
+
+
+def _ff_events_from_json(html):
+    """Parse Forex Factory's embedded calendar data
+    (window.calendarComponentStates[1].days). Each event carries `dateline`
+    (exact UTC epoch) and `timeLabel`. Returns a list of event dicts, or
+    None when the blob is missing/unparseable (caller falls back to HTML
+    rows). Clock-time events get `utc` (epoch) + an ET `time` label; labels
+    like 'All Day' / 'Day 1' / 'Tentative' are passed through with no `utc`
+    because their dateline is not a real release time."""
+    import json as _json
+    raw_days = _ff_extract_bracketed(html, "window.calendarComponentStates[1] = {", "[", "]")
+    if not raw_days:
+        return None
+    js = re.sub(r'([{,]\s*)([A-Za-z_$][A-Za-z0-9_$]*)(\s*:)', r'\1"\2"\3', raw_days)
+    js = js.replace("\\/", "/")
+    try:
+        days = _json.loads(js)
+    except Exception:
+        return None
+    clock_re = re.compile(r"^\d{1,2}:\d{2}[ap]m$")
+    impact_map = {"high": "High", "medium": "Medium", "low": "Low", "holiday": "Holiday"}
+    events = []
+    for d in days:
+        day_label = re.sub(r"<[^>]+>", "", d.get("date", "") or "").strip()
+        for e in d.get("events", []) or []:
+            try:
+                dl = int(e.get("dateline") or 0)
+            except Exception:
+                dl = 0
+            label = (e.get("timeLabel") or "").strip()
+            ev = {
+                "date": day_label,
+                "currency": (e.get("currency") or "").upper(),
+                "impact": impact_map.get(str(e.get("impactName", "")).lower(), ""),
+                "event": e.get("name") or "",
+                "actual": e.get("actual") or "",
+                "forecast": e.get("forecast") or "",
+                "previous": e.get("previous") or "",
+            }
+            if dl and clock_re.match(label):
+                ev["utc"] = dl
+                ev["time"] = _ff_et_label(dl)
+            else:
+                ev["time"] = label
+            events.append(ev)
+    return events if events else None
+
+
 def _fetch_ff_calendar():
     global _ff_cache
     now = time.time()
@@ -186,7 +285,14 @@ def _fetch_ff_calendar():
             "https://www.forexfactory.com/calendar",
             headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0 Safari/537.36"})
         html = urllib.request.urlopen(req, timeout=25).read().decode("utf-8", "ignore")
-        # Parse calendar rows
+        # PRIMARY: embedded JSON data (exact UTC dateline per event). The
+        # server-rendered HTML time cells are filled by JS, so scraping them
+        # leaves some events (e.g. Unemployment Claims) with an empty time.
+        events = _ff_events_from_json(html) or []
+        if events:
+            _ff_cache = {"fetched_at": now, "events": events, "error": None}
+            return _ff_cache
+        # FALLBACK: parse calendar rows (older FF markup)
         row_re = re.compile(r'<tr[^>]*class="[^"]*calendar__row[^"]*"[^>]*>(.*?)</tr>', re.S)
         cell_re = re.compile(r'<td[^>]*class="[^"]*calendar__([a-z-]+)[^"]*"[^>]*>(.*?)</td>', re.S)
         span_re = re.compile(r'<span[^>]*>(.*?)</span>', re.S)
