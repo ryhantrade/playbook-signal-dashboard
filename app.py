@@ -458,9 +458,22 @@ def _binance_tick_loop():
             _t.sleep(1 - dt)
 
 
+_tick_thread = None
+
+
 def _start_binance_ticks():
+    global _tick_thread
     import threading
-    threading.Thread(target=_binance_tick_loop, daemon=True).start()
+
+    def _run():
+        try:
+            _binance_tick_loop()
+        except BaseException as e:  # noqa: BLE001 - thread death must be visible
+            _live_tick_state["thread_error"] = repr(e)[:200]
+            _live_tick_state["connected"] = False
+
+    _tick_thread = threading.Thread(target=_run, daemon=True)
+    _tick_thread.start()
 
 TV_SYM_MAP = {
     "BTCUSD": "BINANCE:BTCUSDT", "ETHUSD": "BINANCE:ETHUSDT",
@@ -651,8 +664,18 @@ def _yf_fetch_bars(market, tf_key):
     try:
         import yfinance as _yf
         import pandas as _pd
-        d = _yf.download(sym, period=period, interval=interval,
-                         progress=False, auto_adjust=False)
+        d = None
+        try:
+            # Ticker.history is the primary path: on Render the
+            # module-level `download` symbol is missing (AttributeError)
+            # while Ticker may still be present.
+            d = _yf.Ticker(sym).history(period=period, interval=interval,
+                                         auto_adjust=False)
+        except AttributeError:
+            d = None
+        if d is None or getattr(d, "empty", True):
+            d = _yf.download(sym, period=period, interval=interval,
+                             progress=False, auto_adjust=False)
         if d is None or getattr(d, "empty", True):
             return None, "yfinance returned no data"
         if isinstance(d.columns, _pd.MultiIndex):
@@ -676,7 +699,15 @@ def _yf_fetch_bars(market, tf_key):
             return None, "yfinance returned no data"
         return bars, None
     except Exception as e:
-        return None, "yfinance error: " + str(e)[:150]
+        diag = ""
+        try:
+            diag = (" [yf v%s %s dl=%s tk=%s]" % (
+                getattr(_yf, "__version__", "?"),
+                getattr(_yf, "__file__", "?"),
+                hasattr(_yf, "download"), hasattr(_yf, "Ticker")))
+        except Exception:
+            pass
+        return None, "yfinance error: " + str(e)[:150] + diag
 
 def _fetch_candles(market, tf):
     """Returns (bars, source, error). TradingView first (short timeout +
@@ -828,12 +859,23 @@ def api_live_status():
     now = time.time()
     ticks = {m: {"price": v["price"], "age_s": round(now - v["ts"], 1)}
              for m, v in _live_tick.items()}
+    try:
+        import yfinance as _yf
+        yf_info = {"version": getattr(_yf, "__version__", None),
+                   "file": getattr(_yf, "__file__", None),
+                   "has_download": hasattr(_yf, "download"),
+                   "has_Ticker": hasattr(_yf, "Ticker")}
+    except Exception as e:
+        yf_info = {"import_error": repr(e)[:200]}
     return _cors(jsonify({"ok": True,
                           "connected": _live_tick_state["connected"],
                           "reconnects": _live_tick_state["reconnects"],
                           "last_attempt": _live_tick_state.get("last_attempt"),
                           "last_error": _live_tick_state.get("last_error"),
                           "url": _live_tick_state.get("url"),
+                          "thread_alive": bool(_tick_thread and _tick_thread.is_alive()),
+                          "thread_error": _live_tick_state.get("thread_error"),
+                          "yf": yf_info,
                           "ticks": ticks}))
 
 # --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
