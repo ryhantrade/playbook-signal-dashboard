@@ -355,6 +355,97 @@ def api_forex_calendar():
 _candle_cache = {}  # (market, tf) -> {"fetched_at": ts, "bars": [...], "source": str}
 _tv_fail_until = {}  # tv_symbol -> ts until which TradingView is skipped (negative cache)
 
+# --- Binance live ticks (~1s) for gold + crypto ---
+# TradingView's anonymous websocket no longer resolves symbols from
+# server egress ("invalid symbol" for every symbol, tested 2026-11-22),
+# and yfinance polling caps the chart at ~5s. Binance's public
+# websocket streams real trade ticks with no key: PAXGUSDT is the same
+# asset as the PAXG-USD candles, so the gold forming bar can move at
+# ~1s. Forex has no Binance feed and stays on the 5s yfinance path.
+# One daemon thread per worker holds the stream and updates in-memory
+# prices only — it never calls yfinance (not thread-safe) and never
+# touches the candle cache structure, so a dead stream degrades to
+# exactly the old 5s behaviour.
+_BINANCE_STREAMS = ("paxgusdt@trade/btcusdt@trade/ethusdt@trade/"
+                    "solusdt@trade/xrpusdt@trade")
+_BINANCE_SYM = {"PAXGUSDT": "XAUUSD", "BTCUSDT": "BTCUSD",
+                "ETHUSDT": "ETHUSD", "SOLUSDT": "SOLUSD",
+                "XRPUSDT": "XRPUSD"}
+_live_tick = {}       # market -> {"price": float, "ts": float}
+_live_tick_state = {"connected": False, "started_at": None,
+                   "last_msg": None, "reconnects": 0}
+
+
+def _apply_live_tick(bars, market, res_secs, now):
+    """Fold the latest Binance tick into the forming bar so the chart
+    moves at ~1s even though yfinance bars refresh every 5s. Only the
+    current (incomplete) bar is touched; closed bars never change."""
+    try:
+        tick = _live_tick.get(market)
+        if not tick or now - tick["ts"] > 5 or not bars:
+            return
+        last = bars[-1]
+        if last["time"] != int(now // res_secs) * res_secs:
+            return  # bar rolled over; next fetch (<=5s) brings the new bar
+        p = tick["price"]
+        if last["open"] == last["high"] == last["low"] == last["close"]:
+            last["open"] = bars[-2]["close"] if len(bars) >= 2 else p
+        last["close"] = p
+        if p > last["high"]:
+            last["high"] = p
+        if p < last["low"]:
+            last["low"] = p
+    except Exception:
+        pass
+
+
+def _binance_tick_loop():
+    import time as _t, json as _j
+    import websocket as _wsc
+    _live_tick_state["started_at"] = _t.time()
+    url = ("wss://stream.binance.com:9443/stream?streams="
+           + _BINANCE_STREAMS)
+    backoff = 1
+    while True:
+        try:
+            ws = _wsc.create_connection(url, timeout=10)
+            _live_tick_state["connected"] = True
+            backoff = 1
+            ws.settimeout(30)
+            while True:
+                raw = ws.recv()
+                try:
+                    d = _j.loads(raw)
+                except Exception:
+                    continue
+                data = d.get("data") or {}
+                sym = _BINANCE_SYM.get(data.get("s", ""))
+                try:
+                    price = float(data.get("p"))
+                except Exception:
+                    continue
+                if not sym or not price:
+                    continue
+                now = _t.time()
+                _live_tick[sym] = {"price": price, "ts": now}
+                _live_tick_state["last_msg"] = now
+                try:
+                    q = _quotes_cache.get("quotes", {}).get(sym)
+                    if q:
+                        q["price"] = round(price, 5)
+                except Exception:
+                    pass
+        except Exception:
+            _live_tick_state["connected"] = False
+            _live_tick_state["reconnects"] += 1
+            _t.sleep(backoff)
+            backoff = min(backoff * 2, 30)
+
+
+def _start_binance_ticks():
+    import threading
+    threading.Thread(target=_binance_tick_loop, daemon=True).start()
+
 TV_SYM_MAP = {
     "BTCUSD": "BINANCE:BTCUSDT", "ETHUSD": "BINANCE:ETHUSDT",
     "SOLUSD": "BINANCE:SOLUSDT", "XRPUSD": "BINANCE:XRPUSDT",
@@ -578,9 +669,11 @@ def _fetch_candles(market, tf):
     cache miss), yfinance fallback; 60-second server cache per market+tf.
 
     NOTE: the cache MUST stay short. The Charting Library polls /udf/history
-    every 5s for the forming bar; a 15-minute cache meant the current bar
-    never moved during its whole life on a 15m chart (frozen chart). 5s
-    matches the widget poll rate so the bar moves live."""
+    every 1s for the forming bar; a 15-minute cache meant the current bar
+    never moved during its whole life on a 15m chart (frozen chart). The 5s
+    cache only gates yfinance fetches — between fetches, the latest Binance
+    tick is folded into the forming bar on every request (_apply_live_tick),
+    so gold/crypto bars move at ~1s while forex stays on the 5s path."""
     market = (market or "").upper().strip()
     tf_key = (tf or "15").strip()
     resolution, res_secs = TV_RES_MAP.get(tf_key, TV_RES_MAP["15"])
@@ -588,6 +681,7 @@ def _fetch_candles(market, tf):
     now = time.time()
     hit = _candle_cache.get(key)
     if hit and now - hit["fetched_at"] < 5 and hit["bars"]:
+        _apply_live_tick(hit["bars"], market, res_secs, now)
         return hit["bars"], hit.get("source"), None
     bars, source, err = None, None, None
     tv_symbol = TV_SYM_MAP.get(market)
@@ -632,6 +726,7 @@ def _fetch_candles(market, tf):
                     last["low"] = min(last["low"], cl["low"])
     except Exception:
         pass
+    _apply_live_tick(bars, market, res_secs, now)
     _candle_cache[key] = {"fetched_at": now, "bars": bars, "source": source}
     return bars, source, None
 
@@ -709,6 +804,18 @@ def api_quotes():
         threading.Thread(target=_refresh_quotes_bg, daemon=True).start()
     return _cors(jsonify({"ok": bool(_quotes_cache["quotes"]),
                           "quotes": _quotes_cache["quotes"]}))
+
+@app.route("/api/live-status")
+def api_live_status():
+    """Binance tick thread health: connected, per-symbol last tick age.
+    Lets us verify from outside that the ~1s feed is alive on Render."""
+    now = time.time()
+    ticks = {m: {"price": v["price"], "age_s": round(now - v["ts"], 1)}
+             for m, v in _live_tick.items()}
+    return _cors(jsonify({"ok": True,
+                          "connected": _live_tick_state["connected"],
+                          "reconnects": _live_tick_state["reconnects"],
+                          "ticks": ticks}))
 
 # --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
 # The Charting Library talks to a UDF-compatible server: /udf/config,
@@ -1172,6 +1279,10 @@ def api_broker_disconnect():
     del creds[broker]
     _save_broker_creds(creds)
     return _cors(jsonify({"ok": True, "broker": broker, "disconnected": True}))
+
+# Start the Binance live-tick thread (daemon; a dead stream only means
+# the chart falls back to the 5s yfinance path).
+_start_binance_ticks()
 
 if __name__ == "__main__":
     app.run(host="0.0.0.0", port=int(os.environ.get("PORT", 5000)))
