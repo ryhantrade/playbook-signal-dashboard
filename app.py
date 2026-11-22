@@ -8,6 +8,17 @@ import json, os, hmac
 from datetime import datetime, timezone
 from flask import Flask, jsonify, Response, request
 
+# Warm the heavy data imports at module level ON PURPOSE. On the Render
+# free tier (0.1 CPU) a lazy `import pandas` inside the first candle
+# request stalls that worker for tens of seconds; with 2 sync workers
+# busy, /health cannot answer within Render's 5s timeout, the instance
+# gets killed and restarted, and the cycle repeats (flapping 502s).
+# Importing here pays the cost once at worker boot, before health
+# checks start. The lazy `import yfinance` calls below then become
+# no-ops (sys.modules cache).
+import yfinance  # noqa: F401
+import pandas  # noqa: F401
+
 BASE = os.path.dirname(os.path.abspath(__file__))
 CACHE = os.path.join(BASE, "signals_cache.json")
 INGEST_SECRET = os.environ.get("INGEST_SECRET", "")
@@ -345,13 +356,13 @@ def api_forex_calendar():
 
 # --- OHLC candles proxy (for TradeMind chart) ---
 # GET /api/candles?market=BTCUSD&tf=15 -> {"ok":true,"source":...,"bars":[...]}
-# PRIMARY source: TradingView's own chart datafeed (anonymous websocket
-# session — the same protocol open-source tvdatafeed clients use), so the
-# candles come from exactly the market data the user sees on TradingView.
-# FALLBACK: yfinance, applied automatically on ANY TradingView failure
-# (unreachable / throttled / bad data). The response always reports which
-# source served the bars ("source": "tradingview" | "yfinance").
+# PRIMARY source: yfinance (Ticker.history). TradingView's anonymous
+# websocket is DISABLED: it is dead from datacenter egress (every symbol
+# returns "invalid symbol", verified 2026-11-22) and its 3.5s attempt per
+# symbol only stalls candle fetches. Set TV_ENABLED back to True only if
+# TV egress is restored.
 # Needs websocket-client (already in requirements.txt).
+TV_ENABLED = False
 _candle_cache = {}  # (market, tf) -> {"fetched_at": ts, "bars": [...], "source": str}
 _tv_fail_until = {}  # tv_symbol -> ts until which TradingView is skipped (negative cache)
 
@@ -732,7 +743,7 @@ def _fetch_candles(market, tf):
         return hit["bars"], hit.get("source"), None
     bars, source, err = None, None, None
     tv_symbol = TV_SYM_MAP.get(market)
-    if tv_symbol and now >= _tv_fail_until.get(tv_symbol, 0):
+    if TV_ENABLED and tv_symbol and now >= _tv_fail_until.get(tv_symbol, 0):
         tb, terr = _tv_fetch_bars(tv_symbol, resolution, res_secs)
         if tb and _bars_sane(tb):
             bars, source = tb, "tradingview"
