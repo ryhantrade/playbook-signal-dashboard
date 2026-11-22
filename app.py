@@ -358,16 +358,14 @@ _tv_fail_until = {}  # tv_symbol -> ts until which TradingView is skipped (negat
 # --- Binance live ticks (~1s) for gold + crypto ---
 # TradingView's anonymous websocket no longer resolves symbols from
 # server egress ("invalid symbol" for every symbol, tested 2026-11-22),
-# and yfinance polling caps the chart at ~5s. Binance's public
-# websocket streams real trade ticks with no key: PAXGUSDT is the same
+# and yfinance polling caps the chart at ~5s. Binance's public REST
+# ticker (polled every 1s, no key): PAXGUSDT is the same
 # asset as the PAXG-USD candles, so the gold forming bar can move at
 # ~1s. Forex has no Binance feed and stays on the 5s yfinance path.
-# One daemon thread per worker holds the stream and updates in-memory
+# One daemon thread per worker polls and updates in-memory
 # prices only — it never calls yfinance (not thread-safe) and never
-# touches the candle cache structure, so a dead stream degrades to
+# touches the candle cache structure, so a dead feed degrades to
 # exactly the old 5s behaviour.
-_BINANCE_STREAMS = ("paxgusdt@trade/btcusdt@trade/ethusdt@trade/"
-                    "solusdt@trade/xrpusdt@trade")
 _BINANCE_SYM = {"PAXGUSDT": "XAUUSD", "BTCUSDT": "BTCUSD",
                 "ETHUSDT": "ETHUSD", "SOLUSDT": "SOLUSD",
                 "XRPUSDT": "XRPUSD"}
@@ -375,11 +373,14 @@ _live_tick = {}       # market -> {"price": float, "ts": float}
 _live_tick_state = {"connected": False, "started_at": None,
                    "last_msg": None, "reconnects": 0,
                    "last_attempt": None, "last_error": None, "url": None}
-# data-stream.binance.vision is Binance's public market-data endpoint;
-# alternate with stream.binance.com on each reconnect — one of them is
-# usually reachable from a given egress region.
-_BINANCE_URLS = ("wss://stream.binance.com:9443/stream?streams=",
-                 "wss://data-stream.binance.vision:9443/stream?streams=")
+# Binance REST ticker (no key). data-api.binance.vision is Binance's
+# public market-data host; alternate with api.binance.com on failures.
+_BINANCE_REST_URLS = (
+    "https://api.binance.com/api/v3/ticker/price?symbols="
+    "%5B%22PAXGUSDT%22,%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22XRPUSDT%22%5D",
+    "https://data-api.binance.vision/api/v3/ticker/price?symbols="
+    "%5B%22PAXGUSDT%22,%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22XRPUSDT%22%5D",
+)
 
 
 def _apply_live_tick(bars, market, res_secs, now):
@@ -405,78 +406,56 @@ def _apply_live_tick(bars, market, res_secs, now):
         pass
 
 
-def _ws_connect(url, timeout=12):
-    """create_connection with a hard wall-clock bound. A hung DNS/TLS
-    phase must not stall the loop forever (observed on Render: the loop
-    sat in its first attempt, reconnects stuck at 0). The connect runs
-    in a throwaway thread that is abandoned if it does not finish."""
-    import threading as _th
-    import websocket as _wsc
-    box = {}
-
-    def _run():
-        try:
-            box["ws"] = _wsc.create_connection(url, timeout=10)
-        except Exception as e:  # noqa: BLE001 - surfaced via state
-            box["err"] = repr(e)
-
-    t = _th.Thread(target=_run, daemon=True)
-    t.start()
-    t.join(timeout)
-    if t.is_alive():
-        return None, "connect-timeout"
-    if "err" in box:
-        return None, box["err"]
-    return box.get("ws"), None
-
-
 def _binance_tick_loop():
-    import time as _t, json as _j
+    """Poll Binance REST ticker every 1s (stdlib urllib, 3s timeout).
+    Replaces the websocket loop: the WS connect froze mid-attempt on
+    Render (last_attempt stuck, reconnects 0) and never surfaced an
+    error, so a persistent connection is the wrong tool here. A short
+    REST poll is fully bounded and its failures show up in live-status
+    within seconds. Ticks feed _apply_live_tick exactly as before."""
+    import time as _t, json as _j, urllib.request as _u
     _live_tick_state["started_at"] = _t.time()
-    backoff = 1
     attempt = 0
     while True:
-        url = _BINANCE_URLS[attempt % len(_BINANCE_URLS)] + _BINANCE_STREAMS
+        url = _BINANCE_REST_URLS[attempt % len(_BINANCE_REST_URLS)]
         attempt += 1
         _live_tick_state["last_attempt"] = _t.time()
         _live_tick_state["url"] = url
+        t0 = _t.time()
         try:
-            ws, err = _ws_connect(url)
-            if err:
-                raise RuntimeError(err)
-            _live_tick_state["connected"] = True
-            _live_tick_state["last_error"] = None
-            backoff = 1
-            ws.settimeout(30)
-            while True:
-                raw = ws.recv()
+            req = _u.Request(url, headers={"User-Agent": "TradeMind/1.0"})
+            with _u.urlopen(req, timeout=3) as resp:
+                data = _j.load(resp)
+            now = _t.time()
+            seen = 0
+            for row in data:
+                sym = _BINANCE_SYM.get(row.get("symbol", ""))
                 try:
-                    d = _j.loads(raw)
-                except Exception:
-                    continue
-                data = d.get("data") or {}
-                sym = _BINANCE_SYM.get(data.get("s", ""))
-                try:
-                    price = float(data.get("p"))
+                    price = float(row.get("price"))
                 except Exception:
                     continue
                 if not sym or not price:
                     continue
-                now = _t.time()
                 _live_tick[sym] = {"price": price, "ts": now}
-                _live_tick_state["last_msg"] = now
+                seen += 1
                 try:
                     q = _quotes_cache.get("quotes", {}).get(sym)
                     if q:
                         q["price"] = round(price, 5)
                 except Exception:
                     pass
+            _live_tick_state["connected"] = True
+            _live_tick_state["last_error"] = None
+            _live_tick_state["last_msg"] = now
+            if seen == 0:
+                raise RuntimeError("empty ticker response")
         except Exception as e:
             _live_tick_state["connected"] = False
             _live_tick_state["last_error"] = repr(e)[:200]
             _live_tick_state["reconnects"] += 1
-            _t.sleep(backoff)
-            backoff = min(backoff * 2, 30)
+        dt = _t.time() - t0
+        if dt < 1:
+            _t.sleep(1 - dt)
 
 
 def _start_binance_ticks():
