@@ -373,7 +373,13 @@ _BINANCE_SYM = {"PAXGUSDT": "XAUUSD", "BTCUSDT": "BTCUSD",
                 "XRPUSDT": "XRPUSD"}
 _live_tick = {}       # market -> {"price": float, "ts": float}
 _live_tick_state = {"connected": False, "started_at": None,
-                   "last_msg": None, "reconnects": 0}
+                   "last_msg": None, "reconnects": 0,
+                   "last_attempt": None, "last_error": None, "url": None}
+# data-stream.binance.vision is Binance's public market-data endpoint;
+# alternate with stream.binance.com on each reconnect — one of them is
+# usually reachable from a given egress region.
+_BINANCE_URLS = ("wss://stream.binance.com:9443/stream?streams=",
+                 "wss://data-stream.binance.vision:9443/stream?streams=")
 
 
 def _apply_live_tick(bars, market, res_secs, now):
@@ -399,17 +405,47 @@ def _apply_live_tick(bars, market, res_secs, now):
         pass
 
 
+def _ws_connect(url, timeout=12):
+    """create_connection with a hard wall-clock bound. A hung DNS/TLS
+    phase must not stall the loop forever (observed on Render: the loop
+    sat in its first attempt, reconnects stuck at 0). The connect runs
+    in a throwaway thread that is abandoned if it does not finish."""
+    import threading as _th
+    import websocket as _wsc
+    box = {}
+
+    def _run():
+        try:
+            box["ws"] = _wsc.create_connection(url, timeout=10)
+        except Exception as e:  # noqa: BLE001 - surfaced via state
+            box["err"] = repr(e)
+
+    t = _th.Thread(target=_run, daemon=True)
+    t.start()
+    t.join(timeout)
+    if t.is_alive():
+        return None, "connect-timeout"
+    if "err" in box:
+        return None, box["err"]
+    return box.get("ws"), None
+
+
 def _binance_tick_loop():
     import time as _t, json as _j
-    import websocket as _wsc
     _live_tick_state["started_at"] = _t.time()
-    url = ("wss://stream.binance.com:9443/stream?streams="
-           + _BINANCE_STREAMS)
     backoff = 1
+    attempt = 0
     while True:
+        url = _BINANCE_URLS[attempt % len(_BINANCE_URLS)] + _BINANCE_STREAMS
+        attempt += 1
+        _live_tick_state["last_attempt"] = _t.time()
+        _live_tick_state["url"] = url
         try:
-            ws = _wsc.create_connection(url, timeout=10)
+            ws, err = _ws_connect(url)
+            if err:
+                raise RuntimeError(err)
             _live_tick_state["connected"] = True
+            _live_tick_state["last_error"] = None
             backoff = 1
             ws.settimeout(30)
             while True:
@@ -435,8 +471,9 @@ def _binance_tick_loop():
                         q["price"] = round(price, 5)
                 except Exception:
                     pass
-        except Exception:
+        except Exception as e:
             _live_tick_state["connected"] = False
+            _live_tick_state["last_error"] = repr(e)[:200]
             _live_tick_state["reconnects"] += 1
             _t.sleep(backoff)
             backoff = min(backoff * 2, 30)
@@ -815,6 +852,9 @@ def api_live_status():
     return _cors(jsonify({"ok": True,
                           "connected": _live_tick_state["connected"],
                           "reconnects": _live_tick_state["reconnects"],
+                          "last_attempt": _live_tick_state.get("last_attempt"),
+                          "last_error": _live_tick_state.get("last_error"),
+                          "url": _live_tick_state.get("url"),
                           "ticks": ticks}))
 
 # --- TradingView UDF datafeed (for TradeMind Advanced Charts) ---
