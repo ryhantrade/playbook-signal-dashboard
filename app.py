@@ -557,13 +557,15 @@ YF_SYM_MAP = {
 }
 
 # frontend tf value -> (yfinance interval, yfinance period)
+# Periods are yfinance's per-interval maxima so the chart holds real
+# history: 15m goes from ~5 days (500 bars) to ~21 days (3000 bars).
 YF_TF_MAP = {
-    "1": ("1m", "1d"), "5": ("5m", "5d"), "15": ("15m", "21d"),
-    "30": ("30m", "21d"), "60": ("1h", "120d"), "240": ("1h", "120d"),
-    "D": ("1d", "2y"), "W": ("1wk", "5y"),
-    "1m": ("1m", "1d"), "5m": ("5m", "5d"), "15m": ("15m", "21d"),
-    "30m": ("30m", "21d"), "1h": ("1h", "120d"), "4h": ("1h", "120d"),
-    "1d": ("1d", "2y"), "1w": ("1wk", "5y"),
+    "1": ("1m", "7d"), "5": ("5m", "60d"), "15": ("15m", "60d"),
+    "30": ("30m", "60d"), "60": ("1h", "730d"), "240": ("1h", "730d"),
+    "D": ("1d", "5y"), "W": ("1wk", "5y"),
+    "1m": ("1m", "7d"), "5m": ("5m", "60d"), "15m": ("15m", "60d"),
+    "30m": ("30m", "60d"), "1h": ("1h", "730d"), "4h": ("1h", "730d"),
+    "1d": ("1d", "5y"), "1w": ("1wk", "5y"),
 }
 
 def _tv_fetch_bars(tv_symbol, resolution, res_secs, n_bars=300, total_timeout=3.5):
@@ -733,7 +735,7 @@ def _yf_fetch_bars(market, tf_key):
                  "high": round(float(r["high"]), 5),
                  "low": round(float(r["low"]), 5),
                  "close": round(float(r["close"]), 5)}
-                for ts, r in df.tail(500).iterrows()]
+                for ts, r in df.tail(3000).iterrows()]
         if not bars:
             return None, "yfinance returned no data"
         return bars, None
