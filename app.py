@@ -385,11 +385,14 @@ _live_tick_state = {"connected": False, "started_at": None,
                    "last_msg": None, "reconnects": 0,
                    "last_attempt": None, "last_error": None, "url": None}
 # Binance REST ticker (no key). data-api.binance.vision is Binance's
-# public market-data host; alternate with api.binance.com on failures.
+# public market-data host and comes FIRST: api.binance.com returns
+# HTTP 451 (geo-blocked) from Render's US region, so leading with it
+# wasted every other poll and left the feed flapping. .com stays only
+# as a fallback if vision ever fails.
 _BINANCE_REST_URLS = (
-    "https://api.binance.com/api/v3/ticker/price?symbols="
-    "%5B%22PAXGUSDT%22,%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22XRPUSDT%22%5D",
     "https://data-api.binance.vision/api/v3/ticker/price?symbols="
+    "%5B%22PAXGUSDT%22,%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22XRPUSDT%22%5D",
+    "https://api.binance.com/api/v3/ticker/price?symbols="
     "%5B%22PAXGUSDT%22,%22BTCUSDT%22,%22ETHUSDT%22,%22SOLUSDT%22,%22XRPUSDT%22%5D",
 )
 
@@ -426,17 +429,26 @@ def _binance_tick_loop():
     within seconds. Ticks feed _apply_live_tick exactly as before."""
     import time as _t, json as _j, urllib.request as _u
     _live_tick_state["started_at"] = _t.time()
-    attempt = 0
     while True:
-        url = _BINANCE_REST_URLS[attempt % len(_BINANCE_REST_URLS)]
-        attempt += 1
         _live_tick_state["last_attempt"] = _t.time()
-        _live_tick_state["url"] = url
         t0 = _t.time()
+        # Try the hosts in order inside one iteration (vision first,
+        # .com as fallback) so a tick lands every second while the
+        # primary host works, instead of alternating and failing
+        # every other poll on the geo-blocked host.
+        data = None
+        for url in _BINANCE_REST_URLS:
+            _live_tick_state["url"] = url
+            try:
+                req = _u.Request(url, headers={"User-Agent": "TradeMind/1.0"})
+                with _u.urlopen(req, timeout=3) as resp:
+                    data = _j.load(resp)
+                break
+            except Exception:
+                continue
         try:
-            req = _u.Request(url, headers={"User-Agent": "TradeMind/1.0"})
-            with _u.urlopen(req, timeout=3) as resp:
-                data = _j.load(resp)
+            if data is None:
+                raise RuntimeError("all Binance hosts failed")
             now = _t.time()
             seen = 0
             for row in data:
@@ -485,6 +497,22 @@ def _start_binance_ticks():
 
     _tick_thread = threading.Thread(target=_run, daemon=True)
     _tick_thread.start()
+
+
+def _ensure_tick_thread():
+    """Restart the Binance tick thread if it died. The loop is
+    while-True and _run records thread_error on exit, but the feed
+    was observed dead with NO error recorded (frozen last_attempt,
+    thread_alive false) — whatever killed it, nothing restarted it.
+    Called from the hot candle/quote paths, so a dead feed heals
+    itself within seconds instead of staying dead until redeploy."""
+    global _tick_thread
+    try:
+        if _tick_thread is not None and _tick_thread.is_alive():
+            return
+        _start_binance_ticks()
+    except Exception:
+        pass
 
 TV_SYM_MAP = {
     "BTCUSD": "BINANCE:BTCUSDT", "ETHUSD": "BINANCE:ETHUSDT",
@@ -790,6 +818,7 @@ def _fetch_candles(market, tf):
 
 @app.route("/api/candles")
 def api_candles():
+    _ensure_tick_thread()
     market = request.args.get("market") or request.args.get("symbol", "")
     tf = request.args.get("tf", "15")
     if not market:
@@ -854,6 +883,7 @@ def _refresh_quotes_bg():
 
 @app.route("/api/quotes")
 def api_quotes():
+    _ensure_tick_thread()
     now = time.time()
     if (now - _quotes_cache["fetched_at"] >= 30
             and not _quotes_cache["refreshing"]):
